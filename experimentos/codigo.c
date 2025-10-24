@@ -18,13 +18,11 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
 #include <math.h>
 #include <omp.h>
-
-// Número de threads utilizada no código paralelo
-#define T 8
 
 // Constantes distintas para gerar x e y a partir de (s_thread, i)
 //
@@ -86,13 +84,18 @@ static inline double u01_from_u64(uint64_t u)
 
 int main(int argc, char *argv[])
 {
-    unsigned long n;
     double start, end, wall_clock_time;
 
-    printf("\nn = ");  // Pergunta a quantidade de pontos
-    scanf("%ld", &n);  // Lê a quantidade de pontos do console
+    if (argc < 3){
+        fprintf(stderr,"uso: %s <N_amostras> <num_threads>\n", argv[0]);
+        return 1;
+    }
 
-    omp_set_num_threads(T);
+    unsigned long n = strtoull(argv[1], NULL, 10);
+    int num_threads = atoi(argv[2]);
+    if (num_threads <= 0)
+        num_threads = 1;
+    omp_set_num_threads(num_threads);
 
     // Geração de uma seed inicial
     uint64_t base_seed = splitmix64(((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid());
@@ -159,31 +162,35 @@ int main(int argc, char *argv[])
             hits += line_hits;
         }
 
-        // Parte 2: Partição Residual
-        // Monte Carlo “puro” sem particionamento por células
-        #pragma omp for simd if(n_tail) schedule(static) reduction(+:hits)
-        for (unsigned long k = 0; k < n_tail; k++)
-        {
-            unsigned long i = n_strata + k;
+				// Parte 2: Partição Residual
+				// Monte Carlo “puro” sem particionamento por células
+				#pragma omp for simd if(n_tail) schedule(static) reduction(+:hits)
+				for (unsigned long k = 0; k < n_tail; k++)
+				{
+						unsigned long i = n_strata + k;
 
-            uint64_t ux = splitmix64(s_thread ^ (i * C1));
-            uint64_t uy = splitmix64((s_thread ^ 0xdeadbeefcafebabeULL) ^ (i * C2));
+						uint64_t ux = splitmix64(s_thread ^ (i * C1));
+						uint64_t uy = splitmix64((s_thread ^ 0xdeadbeefcafebabeULL) ^ (i * C2));
 
-            double x = u01_from_u64(ux);
-            double y = u01_from_u64(uy);
+						double x = u01_from_u64(ux);
+						double y = u01_from_u64(uy);
 
-            double radius2 = x * x + y * y;
-            hits += (radius2 <= 1.0);
-        }
+						double radius2 = x * x + y * y;
+						hits += (radius2 <= 1.0);
+				}
     }
 
     end = omp_get_wtime();
 
-    long double pi = 4.0 * (long double)hits/(long double)n;
-    printf("\nEstimativa de PI = %.9Lf\n", pi);
-
+    long double pi = 4.0L * (long double)hits/(long double)n;
     wall_clock_time = end - start;
-    printf("Tempo de execução: %.6f segundos\n", wall_clock_time);
+
+    printf("codigo,%lu,%d,%.9f,%.12Lf,%.12f\n",
+           (unsigned long)n,
+           num_threads,
+           wall_clock_time,
+           pi,
+           fabs(pi - M_PI));
 
     return 0;
 }
