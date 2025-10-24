@@ -4,11 +4,13 @@
  * Grupo: 5
  * Alunos:
  *	Ana Cristina Silva de Oliveira - Número USP: 11965630
+ *	Didirck Chancel Egnina Ndombi - Número USP: 14822368
+ *	Jean Patrick Ngandu Mamani - Número USP: 14712678
  *	Maíra de Souza Canal - Número USP: 11819403
  *
  * Orientações para compilação:
- *	GCC: gcc codigo.c -fopenmp -O3 -march=native -fno-math-errno -fno-trapping-math -o codigo
- *	Clang: clang codigo.c -fopenmp -O3 -march=native -fno-math-errno -fno-trapping-math -o codigo
+ *	GCC: gcc codigo.c -fopenmp -O3 -march=native -fno-math-errno -fno-trapping-math -ffast-math -lm -o codigo
+ *	Clang: clang codigo.c -fopenmp -O3 -march=native -fno-math-errno -fno-trapping-math -ffast-math -lm -o codigo
  *
  * Uso: ./codigo
  *	O número de pontos deve ser inserido na entrada padrão (stdin).
@@ -18,6 +20,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <time.h>
+#include <math.h>
 #include <omp.h>
 
 // Número de threads utilizada no código paralelo
@@ -83,35 +86,33 @@ static inline double u01_from_u64(uint64_t u)
 
 int main(int argc, char *argv[])
 {
-    unsigned long long n;
+    unsigned long n;
     double start, end, wall_clock_time;
 
     printf("\nn = ");  // Pergunta a quantidade de pontos
-    scanf("%lld", &n); // Lê a quantidade de pontos do console
+    scanf("%ld", &n);  // Lê a quantidade de pontos do console
 
     omp_set_num_threads(T);
 
     // Geração de uma seed inicial
     uint64_t base_seed = splitmix64(((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid());
 
-    unsigned long long hits = 0ULL;
+    unsigned long hits = 0ULL;
 
     start = omp_get_wtime();
 
     // Escolhe S tal que 2 * S * S <= n (duas amostras por célula com antitético)
-    unsigned long long S = 0;
-    for (S = 1; (2ULL * (S + 1) * (S + 1)) <= n; ++S) {}
-
-    unsigned long long n_strata = S * S;
+    unsigned long S = (unsigned long) sqrtl(((long double)n) / 2.0);
+    unsigned long n_strata = S * S;
 
     // Número de pontos usados na partição principal
-    unsigned long long n_used = 2ULL * n_strata;
+    unsigned long n_used = 2ULL * n_strata;
 
     // Os pontos restantes vão para a partição residual
-    unsigned long long n_tail = n - n_used;
+    unsigned long n_tail = n - n_used;
 
-    // Parte 1: Partição Principal
-    // Estratificação + Antitético
+    // Parte 1: Partição Principal (Estratificação + Antitético)
+    // Paralelizamos por linha (iy) entre as threads e vetorizamos por coluna (ix) com operações SIMD
     #pragma omp parallel
     {
         int tid = omp_get_thread_num();
@@ -119,33 +120,43 @@ int main(int argc, char *argv[])
         // Cada thread tem uma seed única
         uint64_t s_thread = splitmix64(base_seed ^ (uint64_t)(tid + 1));
 
-        #pragma omp for simd schedule(static) reduction(+:hits)
-        for (unsigned long long i = 0; i < n_strata; i++)
-        {
-            // Índice linear da célula atual na malha S x S
-            unsigned long long ix = i % S;
-            unsigned long long iy = i / S;
+        #pragma omp for schedule(static) reduction(+:hits)
+        for (unsigned long iy = 0; iy < S; iy++) {
 
-            // Inteiros pseudoaleatórios de 64 bits usados para gerar as coordenadas x e y
-            uint64_t ux = splitmix64(s_thread ^ (i * C1));
-            uint64_t uy = splitmix64((s_thread ^ 0xdeadbeefcafebabeULL) ^ (i * C2));
+            unsigned long row = iy * S;
 
-            // Jitter independente dentro da célula
-            double rx = u01_from_u64(ux);
-            double ry = u01_from_u64(uy);
+            // Acumulador parcial desta linha, que será atualizado vetorialmente
+            unsigned long line_hits = 0ULL;
 
-            // Ponto amostrado dentro da célula
-            double x = (ix + rx) / (double)S;
-            double y = (iy + ry) / (double)S;
+            #pragma omp simd reduction(+:line_hits)
+            for (unsigned long ix = 0; ix < S; ix++) {
+                unsigned long i = row + ix;
 
-            // Ponto original
-            double radius2 = x * x + y * y;
-            hits += (radius2 <= 1.0);
+                // Inteiros pseudoaleatórios de 64 bits usados para gerar as coordenadas x e y
+                uint64_t ux = splitmix64(s_thread ^ (i * C1));
+                uint64_t uy = splitmix64((s_thread ^ 0xdeadbeefcafebabeULL) ^ (i * C2));
 
-            // Antitético (1-x, 1-y): mesma célula “espelhada”
-            double xa = 1.0 - x, ya = 1.0 - y;
-            double radius2a = xa * xa + ya * ya;
-            hits += (radius2a <= 1.0);
+                // Jitter independente dentro da célula
+                double rx = u01_from_u64(ux);
+                double ry = u01_from_u64(uy);
+
+                // Ponto amostrado dentro da célula
+                double x = ((double)ix + rx) / (double)S;
+                double y = ((double)iy + ry) / (double)S;
+
+                // Ponto direto
+                double radius2 = x * x + y * y;
+
+                // Antitético (1-x, 1-y): mesma célula “espelhada”
+                double xa = 1.0 - x, ya = 1.0 - y;
+                double radius2a = xa * xa + ya * ya;
+
+                // Soma das duas contribuições
+                unsigned long new_hits = (radius2 <= 1.0) + (radius2a <= 1.0);
+                line_hits += new_hits;
+            }
+
+            hits += line_hits;
         }
     }
 
@@ -159,9 +170,9 @@ int main(int argc, char *argv[])
         uint64_t s_thread = splitmix64(base_seed ^ (uint64_t)(tid + 1));
 
         #pragma omp for simd schedule(static) reduction(+:hits)
-        for (unsigned long long k = 0; k < n_tail; k++)
+        for (unsigned long k = 0; k < n_tail; k++)
         {
-            unsigned long long i = n_strata + k;
+            unsigned long i = n_strata + k;
 
             uint64_t ux = splitmix64(s_thread ^ (i * C1));
             uint64_t uy = splitmix64((s_thread ^ 0xdeadbeefcafebabeULL) ^ (i * C2));
@@ -169,7 +180,8 @@ int main(int argc, char *argv[])
             double x = u01_from_u64(ux);
             double y = u01_from_u64(uy);
 
-            hits += (x * x + y * y <= 1.0);
+            double radius2 = x * x + y * y;
+            hits += (radius2 <= 1.0);
         }
     }
 
