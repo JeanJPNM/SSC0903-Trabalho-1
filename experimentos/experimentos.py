@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 
-import subprocess
 import math
 import statistics
 import csv
 from pathlib import Path
 import matplotlib.pyplot as plt
+import paramiko
+import threading
 
 # CONFIG GERAL
 
@@ -30,7 +31,7 @@ IMPLEMENTATIONS = [
         "src": "seq_prof.c",
         "bin": "./seq_prof_exec",
         "cflags": [
-            "gcc",
+            "gcc-11",
             "seq_prof.c",
             "-fopenmp",
             "-lm",
@@ -43,7 +44,7 @@ IMPLEMENTATIONS = [
         "src": "par_prof.c",
         "bin": "./par_prof_exec",
         "cflags": [
-            "gcc",
+            "gcc-11",
             "par_prof.c",
             "-fopenmp",
             "-lm",
@@ -56,7 +57,7 @@ IMPLEMENTATIONS = [
         "src": "codigo.c",
         "bin": "./codigo",
         "cflags": [
-            "gcc",
+            "gcc-11",
             "codigo.c",
             "-fopenmp",
             "-O3",
@@ -71,26 +72,126 @@ IMPLEMENTATIONS = [
     },
 ]
 
+REMOTES = {
+    "hal01": 2210,
+    "hal02": 2220,
+    "hal03": 2230,
+    "hal04": 2240,
+    "hal05": 2250,
+    "hal06": 2260,
+    "hal07": 2270,
+    "hal08": 2280,
+    "hal09": 2290,
+    "hal10": 22100,
+    "hal13": 22130,
+}
+
+
 # FUNÇÕES AUX
 
-def compile_all():
+
+def run_all_remote_experiments(password: str):
+    threads: list[threading.Thread] = []
+    raw_rows = []
+    raw_rows_lock = threading.Lock()
+
+    for remote_name, port in REMOTES.items():
+        thread = threading.Thread(
+            target=run_remote_experiment,
+            args=(remote_name, port, password, raw_rows, raw_rows_lock),
+            name="thread_" + remote_name,
+        )
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    return raw_rows
+
+
+def run_remote_experiment(
+    remote_name: str,
+    port: int,
+    password: str,
+    parent_raw_rows: list[dict],
+    raw_rows_lock: threading.Lock,
+):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname="andromeda.lasdpc.icmc.usp.br",
+        port=port,
+        username="ssc903-tb-g05",
+        password=password,
+    )
+
+    remote_dir = f"/home/ssc903-tb-g05/exp_{remote_name}"
+    stdin, stdout, stderr = client.exec_command(f"mkdir -p {remote_dir}")
+    if stdout.channel.recv_exit_status() != 0:
+        raise RuntimeError(
+            f"[{remote_name}] Could not create remote dir {remote_dir}: {stderr.read().decode()}"
+        )
+
+    copy_source_files(client, remote_name, remote_dir)
+
+    compile_all(client, remote_name, remote_dir)
+    local_raw_runs = collect_all_runs(client, remote_name, remote_dir)
+    client.close()
+
+    raw_rows_lock.acquire()
+    parent_raw_rows.extend(local_raw_runs)
+    raw_rows_lock.release()
+
+
+def copy_source_files(client: paramiko.SSHClient, remote_name: str, remote_dir: str):
+    sftp_client = client.open_sftp()
     for impl in IMPLEMENTATIONS:
-        print(f"Compiling {impl['name']} ...")
-        subprocess.run(impl["cflags"], check=True)
-    print("Compilation OK for all.")
+        file = impl["src"]
+        try:
+            sftp_client.put(file, f"{remote_dir}/{file}")
+        except Exception:
+            print(f"[{remote_name}] Error copying {file} to remote")
+            raise
+    sftp_client.close()
 
 
-def run_once(bin_path, N, T):
+def compile_all(client: paramiko.SSHClient, remote_name: str, remote_dir: str):
+    for impl in IMPLEMENTATIONS:
+        print(f"[{remote_name}] Compiling {impl['name']} ...")
+        compile_cmd = " ".join(impl["cflags"])
+        full_cmd = f"cd {remote_dir} && {compile_cmd}"
+        stdin, stdout, stderr = client.exec_command(full_cmd)
+        if stdout.channel.recv_exit_status() != 0:
+            raise RuntimeError(
+                f"[{remote_name}] Compilation failed for {impl['name']} {stderr.read().decode()}"
+            )
+    print(f"[{remote_name}] Compilation OK for all.")
+
+
+def run_once(
+    client: paramiko.SSHClient,
+    bin_path: str,
+    N: int,
+    T: int,
+    remote_name: str,
+    remote_dir: str,
+):
     """
     Executa ./bin_path N T
     Espera linha:
     impl_name,Npoints,threads,elapsed_s,pi_est,abs_err
     """
-    cmd = [bin_path, str(N), str(T)]
-    completed = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    line = completed.stdout.strip().split(",")
+
+    cmd = [str(Path(remote_dir, bin_path)), str(N), str(T)]
+    stdin, stdout, stderr = client.exec_command(" ".join(cmd))
+    output = stdout.read().decode()
+    line = output.strip().split(",")
+
     if len(line) != 6:
-        raise RuntimeError(f"Unexpected output from {bin_path}: {completed.stdout}")
+        raise RuntimeError(
+            f"[{remote_name}] Unexpected output from {bin_path}: {output}\n\n{stderr.read().decode()}"
+        )
 
     impl_name = line[0]
     Npoints = int(line[1])
@@ -101,6 +202,7 @@ def run_once(bin_path, N, T):
 
     return {
         "impl": impl_name,
+        "remote": remote_name,
         "Npoints": Npoints,
         "threads": threads,
         "time_s": elapsed_s,
@@ -109,7 +211,7 @@ def run_once(bin_path, N, T):
     }
 
 
-def collect_all_runs():
+def collect_all_runs(client: paramiko.SSHClient, remote_name: str, remote_dir: str):
     raw_rows = []
     for impl in IMPLEMENTATIONS:
         impl_name = impl["name"]
@@ -123,8 +225,10 @@ def collect_all_runs():
         for N in N_LIST:
             for T in thread_values:
                 for rep in range(REPS):
-                    print(f"Running {impl_name} N={N} T={T} rep={rep+1}/{REPS} ...")
-                    r = run_once(impl["bin"], N, T)
+                    print(
+                        f"[{remote_name}] Running {impl_name} N={N} T={T} rep={rep + 1}/{REPS} ..."
+                    )
+                    r = run_once(client, impl["bin"], N, T, remote_name, remote_dir)
                     raw_rows.append(r)
 
     return raw_rows
@@ -133,11 +237,14 @@ def collect_all_runs():
 def save_csv_raw(raw_rows, path="raw_runs.csv"):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["impl", "Npoints", "threads", "time_s", "pi_est", "err_abs"])
+        w.writerow(
+            ["impl", "remote", "Npoints", "threads", "time_s", "pi_est", "err_abs"]
+        )
         for r in raw_rows:
             w.writerow(
                 [
                     r["impl"],
+                    r["remote"],
                     r["Npoints"],
                     r["threads"],
                     r["time_s"],
@@ -315,6 +422,7 @@ def plot_speedup_abs(summary_rows, outdir):
         plt.savefig(outfile, dpi=200, bbox_inches="tight")
         print(f"Saved {outfile}")
 
+
 def plot_speedup_rel(summary_rows, outdir):
     # Speedup relativo vs Threads
     per_N = {}
@@ -359,6 +467,7 @@ def plot_efficiency(summary_rows, outdir):
         outfile = Path(outdir) / f"efficiency_vs_threads_N{Npoints}.png"
         plt.savefig(outfile, dpi=200, bbox_inches="tight")
         print(f"Saved {outfile}")
+
 
 def plot_error_vs_N(summary_rows, outdir, target_threads_list=THREAD_LIST):
     """
@@ -411,9 +520,9 @@ def plot_error_vs_N(summary_rows, outdir, target_threads_list=THREAD_LIST):
 
 
 def main():
-    compile_all()
+    password = input("Enter SSH password for ssc903-tb-g05: ").strip()
 
-    raw_rows = collect_all_runs()
+    raw_rows = run_all_remote_experiments(password)
     save_csv_raw(raw_rows, "raw_runs.csv")
 
     summary_rows = summarize(raw_rows)
