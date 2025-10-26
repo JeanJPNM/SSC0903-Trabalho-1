@@ -27,7 +27,7 @@ THREAD_LIST = [1, 2, 4, 6, 8]
 
 IMPLEMENTATIONS = [
     {
-        "name": "Sequencial",
+        "name": "seq_prof",
         "src": "seq_prof.c",
         "bin": "./seq_prof_exec",
         "cflags": [
@@ -38,9 +38,12 @@ IMPLEMENTATIONS = [
             "-o",
             "seq_prof_exec",
         ],
+        "threads_to_test": [1],
+        "baseline_for": [],
+        "visible": False,
     },
     {
-        "name": "Paralelo Original",
+        "name": "par_prof",
         "src": "par_prof.c",
         "bin": "./par_prof_exec",
         "cflags": [
@@ -51,9 +54,12 @@ IMPLEMENTATIONS = [
             "-o",
             "par_prof_exec",
         ],
+        "threads_to_test": THREAD_LIST,
+        "baseline_for": ["par_prof"],
+        "visible": True,
     },
     {
-        "name": "Paralelo Desenvolvido",
+        "name": "codigo",
         "src": "codigo.c",
         "bin": "./codigo",
         "cflags": [
@@ -69,6 +75,25 @@ IMPLEMENTATIONS = [
             "-o",
             "codigo",
         ],
+        "threads_to_test": THREAD_LIST,
+        "baseline_for": [],
+        "visible": True,
+    },
+    {
+        "name": "codigo_novec",
+        "src": "codigo_novec.c",
+        "bin": "./codigo_novec",
+        "cflags": [
+            "gcc-11",
+            "codigo_novec.c",
+            "-fopenmp",
+            "-lm",
+            "-o",
+            "codigo_novec",
+        ],
+        "threads_to_test": [1],
+        "baseline_for": ["codigo"],
+        "visible": False,
     },
 ]
 
@@ -215,22 +240,15 @@ def collect_all_runs(client: paramiko.SSHClient, remote_name: str, remote_dir: s
     raw_rows = []
     for impl in IMPLEMENTATIONS:
         impl_name = impl["name"]
-
-        # só 1 thread para o sequencial
-        if impl_name == "seq_prof":
-            thread_values = [1]
-        else:
-            thread_values = THREAD_LIST
-
+        bin_path = impl["bin"]
         for N in N_LIST:
-            for T in thread_values:
+            for T in impl["threads_to_test"]:
                 for rep in range(REPS):
                     print(
                         f"[{remote_name}] Running {impl_name} N={N} T={T} rep={rep + 1}/{REPS} ..."
                     )
-                    r = run_once(client, impl["bin"], N, T, remote_name, remote_dir)
+                    r = run_once(client, bin_path, N, T, remote_name, remote_dir)
                     raw_rows.append(r)
-
     return raw_rows
 
 
@@ -255,70 +273,85 @@ def save_csv_raw(raw_rows, path="raw_runs.csv"):
     print(f"Saved raw data -> {path}")
 
 
-def summarize(raw_rows):
+def build_baseline_map():
     """
-    1) agrupar por (impl, Npoints, threads)
-       -> média e desvio de tempo, média de pi e erro
-    2) speedup absoluto vs seq_prof(threads=1)
-    3) eficiência paralela interna
+    Retorna um dict:
+        baseline_map[target_impl] = baseline_impl
+    Ex:
+        par_prof -> par_prof
+        par_final -> par_final_novec
     """
+    baseline_map = {}
 
+    # cada impl declara em "baseline_for": quem ela serve como baseline
+    for impl in IMPLEMENTATIONS:
+        base_name = impl["name"]
+        for target in impl["baseline_for"]:
+            baseline_map[target] = base_name
+
+        if base_name not in baseline_map:
+            if 1 in impl["threads_to_test"]:
+                baseline_map[base_name] = base_name
+
+    return baseline_map
+
+
+def summarize(raw_rows):
+    # 1. média/ desvio agrupando execuções
     groups = {}
     for row in raw_rows:
         key = (row["impl"], row["Npoints"], row["threads"])
         groups.setdefault(key, []).append(row)
 
-    base_stats = {}  # (impl,Npoints,threads)->stats
+    stats = {}
     for key, rows in groups.items():
         impl, Npoints, threads = key
         times = [r["time_s"] for r in rows]
         pis = [r["pi_est"] for r in rows]
         errs = [r["err_abs"] for r in rows]
 
-        mean_t = statistics.mean(times)
-        std_t = statistics.pstdev(times) if len(times) > 1 else 0.0
-        mean_pi = statistics.mean(pis)
-        mean_err = statistics.mean(errs)
-
-        base_stats[key] = {
+        stats[key] = {
             "impl": impl,
             "Npoints": Npoints,
             "threads": threads,
-            "time_mean_s": mean_t,
-            "time_std_s": std_t,
-            "pi_mean": mean_pi,
-            "err_abs_mean": mean_err,
+            "time_mean_s": statistics.mean(times),
+            "time_std_s": statistics.pstdev(times) if len(times) > 1 else 0.0,
+            "pi_mean": statistics.mean(pis),
+            "err_abs_mean": statistics.mean(errs),
         }
 
-    # passo 2: pegar baseline seq_prof com threads=1 pra cada Npoints
-    # isso serve p/ speedup absoluto.
-    seq_baseline = {}
-    for key, st in base_stats.items():
+    baseline_map = build_baseline_map()
+
+    seq_baseline_time = {}
+    for key, st in stats.items():
         impl, Npoints, threads = key
         if impl == "seq_prof" and threads == 1:
-            seq_baseline[Npoints] = st["time_mean_s"]
+            seq_baseline_time[Npoints] = st["time_mean_s"]
 
-    # passo 3: montar lista final calculando métricas
     summary_rows = []
-    for key, st in base_stats.items():
-        impl, Npoints, threads = key
+    for key, st in stats.items():
+        impl = st["impl"]
+        Npoints = st["Npoints"]
+        threads = st["threads"]
 
-        # speedup absoluto vs seq_prof(1 thread)
-        if Npoints in seq_baseline:
-            speedup_abs = seq_baseline[Npoints] / st["time_mean_s"]
-        else:
-            speedup_abs = math.nan
+        base_impl = baseline_map.get(impl, None)
 
-        # eficiência paralela interna (só faz sentido comparar a versão consigo mesma)
-        # E_impl(T) = [T_impl(1) / T_impl(T)] / T
-        impl_base_key = (impl, Npoints, 1)
-        if impl_base_key in base_stats:
-            t_base_impl = base_stats[impl_base_key]["time_mean_s"]
-            speedup_internal = t_base_impl / st["time_mean_s"]
-            efficiency = speedup_internal / threads
-        else:
-            speedup_internal = math.nan
-            efficiency = math.nan
+        speedup_rel = math.nan
+        efficiency = math.nan
+
+        if base_impl is not None:
+            base_key = (base_impl, Npoints, 1)  # baseline sempre 1 thread
+            if base_key in stats:
+                baseline_time = stats[base_key]["time_mean_s"]
+                speedup_rel = baseline_time / st["time_mean_s"]
+                if threads > 0:
+                    efficiency = speedup_rel / threads
+
+        speedup_abs = math.nan
+        if Npoints in seq_baseline_time:
+            seq_t = seq_baseline_time[Npoints]
+            # mesmo seq_t pra todo mundo (inclusive seq_prof resultará em ~=1)
+            speedup_abs = seq_t / st["time_mean_s"]
 
         summary_rows.append(
             {
@@ -330,7 +363,7 @@ def summarize(raw_rows):
                 "pi_mean": st["pi_mean"],
                 "err_abs_mean": st["err_abs_mean"],
                 "speedup_abs": speedup_abs,
-                "speedup_internal": speedup_internal,
+                "speedup_rel": speedup_rel,
                 "efficiency": efficiency,
             }
         )
@@ -351,7 +384,7 @@ def save_csv_summary(summary_rows, path="summary.csv"):
                 "pi_mean",
                 "err_abs_mean",
                 "speedup_abs",
-                "speedup_internal",
+                "speedup_rel",
                 "efficiency",
             ]
         )
@@ -366,11 +399,18 @@ def save_csv_summary(summary_rows, path="summary.csv"):
                     r["pi_mean"],
                     r["err_abs_mean"],
                     r["speedup_abs"],
-                    r["speedup_internal"],
+                    r["speedup_rel"],
                     r["efficiency"],
                 ]
             )
     print(f"Saved summary -> {path}")
+
+
+def is_visible_impl(name):
+    for impl in IMPLEMENTATIONS:
+        if impl["name"] == name:
+            return impl["visible"]
+    return False
 
 
 def plot_time(summary_rows, outdir):
@@ -403,8 +443,8 @@ def plot_speedup_abs(summary_rows, outdir):
     # Speedup absoluto vs Threads (baseline = seq_prof 1 thread)
     per_N = {}
     for r in summary_rows:
-        if r["impl"] == "seq_prof":
-            continue  # não plotar a própria linha seq_prof
+        if not is_visible_impl(r["impl"]):
+            continue
         per_N.setdefault(r["Npoints"], {}).setdefault(r["impl"], []).append(r)
 
     for Npoints, impl_map in per_N.items():
@@ -427,8 +467,8 @@ def plot_speedup_rel(summary_rows, outdir):
     # Speedup relativo vs Threads
     per_N = {}
     for r in summary_rows:
-        if r["impl"] == "seq_prof":
-            continue  # não plotar a própria linha seq_prof
+        if not is_visible_impl(r["impl"]):
+            continue
         per_N.setdefault(r["Npoints"], {}).setdefault(r["impl"], []).append(r)
 
     for Npoints, impl_map in per_N.items():
@@ -436,7 +476,7 @@ def plot_speedup_rel(summary_rows, outdir):
         for impl, rows in impl_map.items():
             rows_sorted = sorted(rows, key=lambda x: x["threads"])
             x = [rr["threads"] for rr in rows_sorted]
-            y = [rr["speedup_internal"] for rr in rows_sorted]
+            y = [rr["speedup_rel"] for rr in rows_sorted]
             plt.plot(x, y, marker="o", label=impl)
         plt.xlabel("Threads")
         plt.ylabel("Speedup relativo (T_1/T_p)")
@@ -451,6 +491,8 @@ def plot_efficiency(summary_rows, outdir):
     # Eficiência paralela interna vs Threads para cada implementação paralela
     per_N = {}
     for r in summary_rows:
+        if not is_visible_impl(r["impl"]):
+            continue
         per_N.setdefault(r["Npoints"], {}).setdefault(r["impl"], []).append(r)
 
     for Npoints, impl_map in per_N.items():
@@ -485,8 +527,8 @@ def plot_error_vs_N(summary_rows, outdir, target_threads_list=THREAD_LIST):
         # coleta pontos desse T
         per_impl = {}
         for r in summary_rows:
-            if r["impl"] == "seq_prof":
-                continue  # não queremos o sequencial aqui
+            if not is_visible_impl(r["impl"]):
+                continue
             if r["threads"] != Tsel:
                 continue  # só o T atual
 
